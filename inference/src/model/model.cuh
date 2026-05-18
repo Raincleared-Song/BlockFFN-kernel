@@ -34,6 +34,7 @@ struct ModelImpl : Model {
     int num_key_value_heads;
     int head_dim;
     float rms_norm_eps;
+    int router_topk;
 
     int chunk_length;
 
@@ -57,7 +58,8 @@ struct ModelImpl : Model {
         int head_dim,
         float rms_norm_eps,
         int chunk_length,
-        bool use_kernel
+        bool use_kernel,
+        int router_topk = 0
     ) {
         this->vocab_size = vocab_size;
         this->num_hidden_layers = num_hidden_layers;
@@ -67,6 +69,7 @@ struct ModelImpl : Model {
         this->num_key_value_heads = num_key_value_heads;
         this->head_dim = head_dim;
         this->rms_norm_eps = rms_norm_eps;
+        this->router_topk = router_topk;
 
         this->chunk_length = chunk_length;
         
@@ -76,7 +79,7 @@ struct ModelImpl : Model {
 
         embedding = new Embedding<T>(vocab_size, hidden_size);
         for (int i = 0; i < num_hidden_layers; i++) {
-            layers.push_back(new Layer<T, false>(hidden_size, intermediate_size, num_attention_heads, num_key_value_heads, head_dim, rms_norm_eps, use_kernel, /*is_moe=*/i>0, num_blocks));
+            layers.push_back(new Layer<T, false>(hidden_size, intermediate_size, num_attention_heads, num_key_value_heads, head_dim, rms_norm_eps, use_kernel, /*is_moe=*/i>0, num_blocks, router_topk));
         }
         norm = new RMSNorm<T>(hidden_size, rms_norm_eps);
         lm_head = new LMHead<T>(hidden_size, vocab_size);

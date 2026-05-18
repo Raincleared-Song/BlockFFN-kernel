@@ -2,22 +2,67 @@
 
 #include "ffn.cuh"
 #include "block_ffn_kernel.cuh"
+#include "topk.cuh"
+
+namespace {
+template <typename T>
+__global__ void topk_softmax_scatter_kernel(int dim, int top, const T* topk_val, const int* topk_pos, T* output) {
+    int row = blockIdx.x;
+    int row_dim = row * dim;
+    int row_top = row * top;
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        output[row_dim + i] = T(0);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float mx = -float(TypeTraits<T>::inf());
+        for (int i = 0; i < top; i++) {
+            mx = fmaxf(mx, float(topk_val[row_top + i]));
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < top; i++) {
+            sum += expf(float(topk_val[row_top + i]) - mx);
+        }
+
+        for (int i = 0; i < top; i++) {
+            int pos = topk_pos[row_top + i];
+            float score = expf(float(topk_val[row_top + i]) - mx) / sum;
+            output[row_dim + pos] = T(score);
+        }
+    }
+}
+
+template <typename T>
+void topk_softmax_scatter(const Stream& stream, int num_tokens, int dim, int top, const T* topk_val, const int* topk_pos, T* output) {
+    topk_softmax_scatter_kernel<T><<<num_tokens, 256, 0, stream.stream>>>(dim, top, topk_val, topk_pos, output);
+}
+}
 
 template <typename T>
 struct Router {
     int hidden_size;
     int num_blocks;
+    int router_topk;
 
     Linear<T> *proj;
     SimpleLayerNorm<T> *norm;
+    functions::TopK<T> *topk_func;
     T* output;
 
-    Router(int hidden_size, int num_blocks, float rms_norm_eps) {
+    Router(int hidden_size, int num_blocks, float rms_norm_eps, int router_topk = 0) {
         this->hidden_size = hidden_size;
         this->num_blocks = num_blocks;
+        this->router_topk = router_topk;
+        if (this->router_topk < 0 || this->router_topk > this->num_blocks || this->router_topk > 64) {
+            throw std::invalid_argument("Unsupported router_topk " + std::to_string(this->router_topk));
+        }
 
         this->proj = new Linear<T>(hidden_size, num_blocks);
         this->norm = new SimpleLayerNorm<T>(num_blocks);
+        this->topk_func = this->router_topk > 0 ? new functions::TopK<T>(num_blocks, this->router_topk) : nullptr;
     }
 
     void init_weight_ptr(Memory* memory) {
@@ -27,6 +72,9 @@ struct Router {
 
     int64_t init_output_ptr(Memory* memory, int32_t num_tokens, int64_t offset) {
         int64_t proj_end = this->proj->init_output_ptr(memory, num_tokens, offset);
+        if (this->topk_func != nullptr) {
+            proj_end = this->topk_func->init_output_ptr(memory, num_tokens, proj_end);
+        }
         this->output = this->proj->output;
         // norm inplace
         return proj_end;
@@ -44,7 +92,12 @@ struct Router {
 
     void prefill(const Stream& stream, int32_t num_tokens, T* input) {
         this->proj->prefill(stream, num_tokens, input);
-        relu_inplace(stream, num_tokens, this->num_blocks, this->proj->output);
+        if (this->topk_func != nullptr) {
+            this->topk_func->prefill(stream, num_tokens, this->proj->output);
+            topk_softmax_scatter(stream, num_tokens, this->num_blocks, this->router_topk, this->topk_func->topk_val, this->topk_func->topk_pos, this->proj->output);
+        } else {
+            relu_inplace(stream, num_tokens, this->num_blocks, this->proj->output);
+        }
         this->norm->prefill(stream, num_tokens, this->proj->output, this->proj->output);
     }
 };
@@ -56,6 +109,7 @@ struct BlockFFN : FFN<T> {
     int num_blocks, block_size;
     float rms_norm_eps;
     bool use_kernel;
+    int router_topk;
     Router<T> *router;
     int *nnz;
     T *nz_val; int *nz_idx;
@@ -74,15 +128,16 @@ struct BlockFFN : FFN<T> {
 
     T* shared_gated_up;
 
-    BlockFFN(int hidden_size, int intermediate_size, float rms_norm_eps, int block_size, bool use_kernel = false) {
+    BlockFFN(int hidden_size, int intermediate_size, float rms_norm_eps, int block_size, bool use_kernel = false, int router_topk = 0) {
         this->hidden_size = hidden_size;
         this->intermediate_size = intermediate_size;
         this->num_blocks = intermediate_size / block_size;
         this->block_size = block_size;
         this->rms_norm_eps = rms_norm_eps;
         this->use_kernel = use_kernel;
+        this->router_topk = router_topk;
 
-        this->router = new Router<T>(hidden_size, num_blocks, rms_norm_eps);
+        this->router = new Router<T>(hidden_size, num_blocks, rms_norm_eps, router_topk);
 
         this->ffn_norm = new RMSNorm<T>(hidden_size, rms_norm_eps);
 

@@ -206,3 +206,7 @@ build/
 
 .DS_Store
 .vscode
+
+inference/data/spec_bench/model_answer/blockffn-v2/baseline.jsonl
+inference/data/spec_bench/model_answer/blockffn-v2/kernel*.jsonl
+inference/data/spec_bench/model_answer/blockffn-v2-bak/

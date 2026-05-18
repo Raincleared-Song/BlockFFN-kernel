@@ -12,13 +12,13 @@ struct Layer {
     FFN<T> *ffn;
     T* output;
 
-    Layer(int hidden_size, int intermediate_size, int num_attention_heads, int num_key_value_heads, int head_dim, float rms_norm_eps, bool use_kernel = false, bool is_moe = false, int num_blocks = -1) {
+    Layer(int hidden_size, int intermediate_size, int num_attention_heads, int num_key_value_heads, int head_dim, float rms_norm_eps, bool use_kernel = false, bool is_moe = false, int num_blocks = -1, int router_topk = 0) {
         if constexpr (is_eagle) {
             this->attn = new Attention<T>(hidden_size, num_attention_heads, num_key_value_heads, head_dim, rms_norm_eps);
             this->ffn = new GatedFFN<T>(hidden_size, intermediate_size, rms_norm_eps);
         } if (is_moe) {
             this->attn = new Attention<T>(hidden_size, num_attention_heads, num_key_value_heads, head_dim, rms_norm_eps);
-            this->ffn = new BlockFFN<T>(hidden_size, num_blocks * 128, rms_norm_eps, 128, use_kernel);
+            this->ffn = new BlockFFN<T>(hidden_size, num_blocks * 128, rms_norm_eps, 128, use_kernel, router_topk);
         } else {
             this->attn = new Attention<T>(hidden_size, num_attention_heads, num_key_value_heads, head_dim, rms_norm_eps);
             this->ffn = new GatedFFN<T>(hidden_size, intermediate_size, rms_norm_eps);

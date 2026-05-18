@@ -26,6 +26,7 @@ class LLM(torch.nn.Module):
                  dtype: torch.dtype = None,
                  cuda_graph: bool = False,
                  use_kernel: bool = False,
+                 router_topk: int = None,
     ):
         super().__init__()
 
@@ -35,6 +36,7 @@ class LLM(torch.nn.Module):
         self.dtype = dtype if dtype is not None else self.config.torch_dtype
         self.dtype_int = dtype_to_int(self.dtype)
         self.cuda_graph = cuda_graph
+        self.router_topk = int(os.environ.get("BLOCKFFN_ROUTER_TOPK", "0")) if router_topk is None else router_topk
 
         self.memory_limit = int(torch.cuda.get_device_properties(0).total_memory * memory_limit)
         self.memory_pool = torch.nn.Parameter(torch.empty(self.memory_limit, dtype=torch.uint8, device="cuda"), requires_grad=False)
@@ -60,6 +62,7 @@ class LLM(torch.nn.Module):
             self.dtype_int,
             self.chunk_length,
             use_kernel,
+            self.router_topk,
         )
 
         self.logits = torch.empty((64, self.config.vocab_size), dtype=self.dtype, device="cuda")

@@ -1,6 +1,7 @@
 #pragma once
 #include "../utils.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
 
 #define ALIGN_SIZE 16
 
@@ -19,6 +20,12 @@ struct Memory {
         uint8_t* ret = memory_pool + model_offset;
         model_offset += size;
         model_offset = ROUND_UP(model_offset, ALIGN_SIZE); // Align to 16 bytes
+        if (model_offset > memory_limit) {
+            throw std::runtime_error(
+                "Memory pool exceeded while allocating model weights: offset " +
+                std::to_string(model_offset) + " > limit " + std::to_string(memory_limit)
+            );
+        }
         return (void*)ret;
     }
     
@@ -26,6 +33,12 @@ struct Memory {
         *ptr = memory_pool + offset;
         offset += size;
         offset = ROUND_UP(offset, ALIGN_SIZE); // Align to 16 bytes
+        if (offset > memory_limit) {
+            throw std::runtime_error(
+                "Memory pool exceeded while allocating runtime buffers: offset " +
+                std::to_string(offset) + " > limit " + std::to_string(memory_limit)
+            );
+        }
         return offset;
     }
 };

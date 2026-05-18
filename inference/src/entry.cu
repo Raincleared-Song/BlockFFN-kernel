@@ -34,7 +34,8 @@ void init_base_model(
     float rms_norm_eps,
     int torch_dtype,
     int chunk_length,
-    bool use_kernel
+    bool use_kernel,
+    int router_topk
 ) {
     init_resources();
 
@@ -52,7 +53,8 @@ void init_base_model(
             head_dim,
             rms_norm_eps,
             chunk_length,
-            use_kernel
+            use_kernel,
+            router_topk
         );
     });
 
