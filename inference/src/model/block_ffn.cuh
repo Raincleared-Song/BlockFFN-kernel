@@ -39,6 +39,76 @@ template <typename T>
 void topk_softmax_scatter(const Stream& stream, int num_tokens, int dim, int top, const T* topk_val, const int* topk_pos, T* output) {
     topk_softmax_scatter_kernel<T><<<num_tokens, 256, 0, stream.stream>>>(dim, top, topk_val, topk_pos, output);
 }
+
+// Fused softmax + router_norm scale + nonzero-style compaction for the decode/use_kernel path.
+// Bit-exact equivalent to: topk_softmax_scatter -> SimpleLayerNorm (elementwise_mul by router_norm) -> nonzero,
+// including the (val > 0) filter that nonzero applies.
+//
+// Designed for num_tokens == 1 and top <= 64. Uses one block with two warps.
+template <typename T>
+__global__ void topk_to_sparse_kernel(
+    int top,
+    const T* __restrict__ topk_val,    // (top,)
+    const int* __restrict__ topk_pos,  // (top,)
+    const T* __restrict__ norm_weight, // (num_blocks,)
+    int* __restrict__ nnz,             // (1,)
+    T* __restrict__ nz_val,            // (top,)
+    int* __restrict__ nz_idx           // (top,)
+) {
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    __shared__ float warp_max[2];
+    __shared__ float warp_sum[2];
+    __shared__ int warp_count[2];
+
+    bool active = (tid < top);
+    float v = active ? float(topk_val[tid]) : -float(TypeTraits<T>::inf());
+    int pos = active ? topk_pos[tid] : 0;
+
+    float mx = v;
+    #pragma unroll
+    for (int j = 16; j > 0; j >>= 1) {
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, j));
+    }
+    if (lane == 0) warp_max[warp] = mx;
+    __syncthreads();
+    float gmax = fmaxf(warp_max[0], warp_max[1]);
+
+    float e = active ? expf(v - gmax) : 0.0f;
+    float s = e;
+    #pragma unroll
+    for (int j = 16; j > 0; j >>= 1) {
+        s += __shfl_xor_sync(0xffffffff, s, j);
+    }
+    if (lane == 0) warp_sum[warp] = s;
+    __syncthreads();
+    float gsum = warp_sum[0] + warp_sum[1];
+
+    float w = active ? float(norm_weight[pos]) : 0.0f;
+    float val = (e / gsum) * w;
+    bool keep = active && (val > 0.0f);
+
+    unsigned mask = __ballot_sync(0xffffffff, keep);
+    if (lane == 0) warp_count[warp] = __popc(mask);
+    __syncthreads();
+
+    int warp_offset = (warp > 0) ? warp_count[0] : 0;
+    if (keep) {
+        int compact_idx = warp_offset + __popc(mask & ((1u << lane) - 1));
+        nz_val[compact_idx] = T(val);
+        nz_idx[compact_idx] = pos;
+    }
+    if (tid == 0) {
+        nnz[0] = warp_count[0] + warp_count[1];
+    }
+}
+
+template <typename T>
+void topk_to_sparse(const Stream& stream, int top, const T* topk_val, const int* topk_pos, const T* norm_weight, int* nnz, T* nz_val, int* nz_idx) {
+    topk_to_sparse_kernel<T><<<1, 64, 0, stream.stream>>>(top, topk_val, topk_pos, norm_weight, nnz, nz_val, nz_idx);
+}
 }
 
 template <typename T>
@@ -226,14 +296,33 @@ struct BlockFFN : FFN<T> {
 
     void decode(const Stream& stream, int32_t num_tokens, T* input, T* prev_output) {
         this->ffn_norm->prefill(stream, num_tokens, input, prev_output);
-        this->router->prefill(stream, num_tokens, this->ffn_norm->output);
+
+        bool fused_topk_sparse = (this->use_kernel && num_tokens == 1 && this->router_topk > 0);
+        if (fused_topk_sparse) {
+            // Run only proj + TopK in the router; defer scatter + norm + nonzero to the fused kernel below.
+            this->router->proj->prefill(stream, num_tokens, this->ffn_norm->output);
+            this->router->topk_func->prefill(stream, num_tokens, this->router->proj->output);
+        } else {
+            this->router->prefill(stream, num_tokens, this->ffn_norm->output);
+        }
         T* rs = this->router->output;
 
         dot_product(stream, num_tokens, hidden_size, this->ffn_norm->output, this->up_proj_mean, this->projected_mean);
 
         if (this->use_kernel) {
             if (num_tokens == 1) {
-                nonzero(stream, this->num_blocks, rs, this->nnz, this->nz_val, this->nz_idx);
+                if (fused_topk_sparse) {
+                    topk_to_sparse<T>(
+                        stream,
+                        this->router_topk,
+                        this->router->topk_func->topk_val,
+                        this->router->topk_func->topk_pos,
+                        this->router->norm->weight,
+                        this->nnz, this->nz_val, this->nz_idx
+                    );
+                } else {
+                    nonzero(stream, this->num_blocks, rs, this->nnz, this->nz_val, this->nz_idx);
+                }
                 sparse_up(stream, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->ffn_norm->output, this->up_proj->weight, this->up_proj->output);
                 sparse_norm_silu(stream, this->num_blocks, this->block_size, this->nnz, this->nz_idx, this->nz_val, this->projected_mean, this->norm_silu->weight, this->norm_silu->eps, this->up_proj->output);
                 sparse_down(stream, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->up_proj->output, this->down_proj->weight, this->down_proj->output);

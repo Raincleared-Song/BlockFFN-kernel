@@ -6,7 +6,7 @@ export BLOCKFFN_ROUTER_TOPK=${BLOCKFFN_ROUTER_TOPK:-36}
 python3 evaluation/inference_baseline.py \
     $@ \
     --cuda-graph \
-    --model-id $Model_id/kernel_topk_${BLOCKFFN_ROUTER_TOPK} \
+    --model-id $Model_id/kernel_topk_v2_${BLOCKFFN_ROUTER_TOPK} \
     --memory-limit 0.5 \
     --bench-name $Bench_name \
     --dtype "bfloat16" \
