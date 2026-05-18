@@ -44,17 +44,21 @@ void topk_softmax_scatter(const Stream& stream, int num_tokens, int dim, int top
 // Bit-exact equivalent to: topk_softmax_scatter -> SimpleLayerNorm (elementwise_mul by router_norm) -> nonzero,
 // including the (val > 0) filter that nonzero applies.
 //
-// Designed for num_tokens == 1 and top <= 64. Uses one block with two warps.
+// Batched: one block per token, two warps (64 threads) per block. Handles top <= 64.
+// Output layouts use num_blocks as the per-token stride for nz_val/nz_idx, matching the
+// downstream sparse kernels.
 template <typename T>
 __global__ void topk_to_sparse_kernel(
     int top,
-    const T* __restrict__ topk_val,    // (top,)
-    const int* __restrict__ topk_pos,  // (top,)
+    int num_blocks,
+    const T* __restrict__ topk_val,    // (num_tokens, top)
+    const int* __restrict__ topk_pos,  // (num_tokens, top)
     const T* __restrict__ norm_weight, // (num_blocks,)
-    int* __restrict__ nnz,             // (1,)
-    T* __restrict__ nz_val,            // (top,)
-    int* __restrict__ nz_idx           // (top,)
+    int* __restrict__ nnz,             // (num_tokens,)
+    T* __restrict__ nz_val,            // (num_tokens, num_blocks)
+    int* __restrict__ nz_idx           // (num_tokens, num_blocks)
 ) {
+    int token = blockIdx.x;
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
@@ -63,9 +67,12 @@ __global__ void topk_to_sparse_kernel(
     __shared__ float warp_sum[2];
     __shared__ int warp_count[2];
 
+    int token_offset_in = token * top;
+    int token_offset_out = token * num_blocks;
+
     bool active = (tid < top);
-    float v = active ? float(topk_val[tid]) : -float(TypeTraits<T>::inf());
-    int pos = active ? topk_pos[tid] : 0;
+    float v = active ? float(topk_val[token_offset_in + tid]) : -float(TypeTraits<T>::inf());
+    int pos = active ? topk_pos[token_offset_in + tid] : 0;
 
     float mx = v;
     #pragma unroll
@@ -97,17 +104,17 @@ __global__ void topk_to_sparse_kernel(
     int warp_offset = (warp > 0) ? warp_count[0] : 0;
     if (keep) {
         int compact_idx = warp_offset + __popc(mask & ((1u << lane) - 1));
-        nz_val[compact_idx] = T(val);
-        nz_idx[compact_idx] = pos;
+        nz_val[token_offset_out + compact_idx] = T(val);
+        nz_idx[token_offset_out + compact_idx] = pos;
     }
     if (tid == 0) {
-        nnz[0] = warp_count[0] + warp_count[1];
+        nnz[token] = warp_count[0] + warp_count[1];
     }
 }
 
 template <typename T>
-void topk_to_sparse(const Stream& stream, int top, const T* topk_val, const int* topk_pos, const T* norm_weight, int* nnz, T* nz_val, int* nz_idx) {
-    topk_to_sparse_kernel<T><<<1, 64, 0, stream.stream>>>(top, topk_val, topk_pos, norm_weight, nnz, nz_val, nz_idx);
+void topk_to_sparse(const Stream& stream, int num_tokens, int top, int num_blocks, const T* topk_val, const int* topk_pos, const T* norm_weight, int* nnz, T* nz_val, int* nz_idx) {
+    topk_to_sparse_kernel<T><<<num_tokens, 64, 0, stream.stream>>>(top, num_blocks, topk_val, topk_pos, norm_weight, nnz, nz_val, nz_idx);
 }
 }
 
@@ -245,9 +252,11 @@ struct BlockFFN : FFN<T> {
         // norm_silu inplace
         offset = this->down_proj->init_output_ptr(memory, num_tokens, offset);
         this->output = this->down_proj->output;
-        offset = memory->allocate((void**)&nnz, offset, sizeof(int));
+        // Per-token strides for the batched sparse path. The single-token paths
+        // see token offset 0 and remain correct.
+        offset = memory->allocate((void**)&nnz, offset, num_tokens * sizeof(int));
         offset = memory->allocate((void**)&nz_val, offset, num_tokens * this->num_blocks * sizeof(T));
-        offset = memory->allocate((void**)&nz_idx, offset, this->num_blocks * sizeof(int));
+        offset = memory->allocate((void**)&nz_idx, offset, num_tokens * this->num_blocks * sizeof(int));
         return offset;
     }
 
@@ -297,9 +306,10 @@ struct BlockFFN : FFN<T> {
     void decode(const Stream& stream, int32_t num_tokens, T* input, T* prev_output) {
         this->ffn_norm->prefill(stream, num_tokens, input, prev_output);
 
-        bool fused_topk_sparse = (this->use_kernel && num_tokens == 1 && this->router_topk > 0);
+        // Fused TopK -> sparse path works for any num_tokens; defer scatter + norm + nonzero
+        // to the fused kernel and run only proj + TopK in the router.
+        bool fused_topk_sparse = (this->use_kernel && this->router_topk > 0);
         if (fused_topk_sparse) {
-            // Run only proj + TopK in the router; defer scatter + norm + nonzero to the fused kernel below.
             this->router->proj->prefill(stream, num_tokens, this->ffn_norm->output);
             this->router->topk_func->prefill(stream, num_tokens, this->router->proj->output);
         } else {
@@ -309,27 +319,37 @@ struct BlockFFN : FFN<T> {
 
         dot_product(stream, num_tokens, hidden_size, this->ffn_norm->output, this->up_proj_mean, this->projected_mean);
 
-        if (this->use_kernel) {
+        if (this->use_kernel && fused_topk_sparse) {
+            // TopK + sparse path (works for num_tokens >= 1).
+            topk_to_sparse<T>(
+                stream,
+                num_tokens,
+                this->router_topk,
+                this->num_blocks,
+                this->router->topk_func->topk_val,
+                this->router->topk_func->topk_pos,
+                this->router->norm->weight,
+                this->nnz, this->nz_val, this->nz_idx
+            );
             if (num_tokens == 1) {
-                if (fused_topk_sparse) {
-                    topk_to_sparse<T>(
-                        stream,
-                        this->router_topk,
-                        this->router->topk_func->topk_val,
-                        this->router->topk_func->topk_pos,
-                        this->router->norm->weight,
-                        this->nnz, this->nz_val, this->nz_idx
-                    );
-                } else {
-                    nonzero(stream, this->num_blocks, rs, this->nnz, this->nz_val, this->nz_idx);
-                }
                 sparse_up(stream, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->ffn_norm->output, this->up_proj->weight, this->up_proj->output);
                 sparse_norm_silu(stream, this->num_blocks, this->block_size, this->nnz, this->nz_idx, this->nz_val, this->projected_mean, this->norm_silu->weight, this->norm_silu->eps, this->up_proj->output);
                 sparse_down(stream, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->up_proj->output, this->down_proj->weight, this->down_proj->output);
             } else {
-                throw std::invalid_argument("block_ffn: Unsupported num_tokens " + std::to_string(num_tokens));
+                sparse_up_batched<T>(stream, num_tokens, this->router_topk, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->ffn_norm->output, this->up_proj->weight, this->up_proj->output);
+                sparse_norm_silu_batched<T>(stream, num_tokens, this->router_topk, this->num_blocks, this->block_size, this->nnz, this->nz_idx, this->nz_val, this->projected_mean, this->norm_silu->weight, this->norm_silu->eps, this->up_proj->output);
+                sparse_down_batched<T>(stream, num_tokens, this->router_topk, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->up_proj->output, this->down_proj->weight, this->down_proj->output);
             }
+        } else if (this->use_kernel && num_tokens == 1) {
+            // ReLU + use_kernel + single token: existing single-token sparse path.
+            nonzero(stream, this->num_blocks, rs, this->nnz, this->nz_val, this->nz_idx);
+            sparse_up(stream, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->ffn_norm->output, this->up_proj->weight, this->up_proj->output);
+            sparse_norm_silu(stream, this->num_blocks, this->block_size, this->nnz, this->nz_idx, this->nz_val, this->projected_mean, this->norm_silu->weight, this->norm_silu->eps, this->up_proj->output);
+            sparse_down(stream, this->num_blocks, this->block_size, this->hidden_size, this->nnz, this->nz_idx, this->up_proj->output, this->down_proj->weight, this->down_proj->output);
         } else {
+            // ReLU + use_kernel + num_tokens>1, or !use_kernel: fall back to dense compute.
+            // (Per-token variable nnz under ReLU does not fit the batched sparse grid well,
+            // and for large num_tokens the dense GEMM is faster anyway.)
             this->up_proj->prefill(stream, num_tokens, this->ffn_norm->output);
             this->norm_silu->prefill(stream, num_tokens, this->up_proj->output, this->projected_mean, this->up_proj->output);
             batched_mul(stream, num_tokens * this->num_blocks, this->block_size, this->up_proj->output, rs, this->up_proj->output);

@@ -259,3 +259,230 @@ void nonzero(const Stream& stream, int num_blocks, const T* input, int* nnz, T* 
   }
 }
 
+// =============================================================================
+// Batched sparse kernels (num_tokens >= 1).
+//
+// Layouts:
+//   nnz:       (num_tokens,)
+//   nz_idx:    (num_tokens, num_blocks) — first nnz[token] entries valid per token
+//   nz_val:    (num_tokens, num_blocks) — first nnz[token] entries valid per token
+//   input/output activations: (num_tokens, ...).
+//
+// Designed for TopK routing where nnz[token] <= top <= num_blocks. Grid uses `top`
+// as the per-token upper bound so blocks past nnz[token] early-return.
+// =============================================================================
+
+template <typename T>
+__global__ void sparse_up_batched_kernel(
+    int top,
+    int num_blocks,
+    int intermediate_size,   // num_blocks * block_size (T units)
+    int hidden_size_f4,
+    int tile_size,
+    const int* __restrict__ nnz,
+    const int* __restrict__ nz_idx,
+    const float4* __restrict__ input,
+    const float4* __restrict__ weights,
+    T* __restrict__ output
+) {
+    using T2 = typename TypeTraits<T>::half2;
+
+    int tid = threadIdx.x;
+    int token = blockIdx.x / top;
+    int k = blockIdx.x % top;
+    if (k >= nnz[token]) return;
+
+    int block_size = gridDim.y * tile_size; // T units
+    int expert_idx = nz_idx[token * num_blocks + k];
+    int row = expert_idx * block_size + blockIdx.y * tile_size + threadIdx.y;
+    int row_offset = row * hidden_size_f4;
+    int input_token_offset = token * hidden_size_f4;
+    int output_token_offset = token * intermediate_size;
+
+    float4 partial_sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = tid; j < hidden_size_f4; j += blockDim.x) {
+        float4 a = input[input_token_offset + j];
+        float4 b = weights[row_offset + j];
+        T2 prodx = __hmul2(*reinterpret_cast<T2*>(&a.x), *reinterpret_cast<T2*>(&b.x));
+        T2 prody = __hmul2(*reinterpret_cast<T2*>(&a.y), *reinterpret_cast<T2*>(&b.y));
+        T2 prodz = __hmul2(*reinterpret_cast<T2*>(&a.z), *reinterpret_cast<T2*>(&b.z));
+        T2 prodw = __hmul2(*reinterpret_cast<T2*>(&a.w), *reinterpret_cast<T2*>(&b.w));
+        partial_sum.x += float(prodx.x) + float(prodx.y);
+        partial_sum.y += float(prody.x) + float(prody.y);
+        partial_sum.z += float(prodz.x) + float(prodz.y);
+        partial_sum.w += float(prodw.x) + float(prodw.y);
+    }
+    float sum = partial_sum.x + partial_sum.y + partial_sum.z + partial_sum.w;
+    sum += __shfl_down_sync(0xffffffff, sum, 16);
+    sum += __shfl_down_sync(0xffffffff, sum, 8);
+    sum += __shfl_down_sync(0xffffffff, sum, 4);
+    sum += __shfl_down_sync(0xffffffff, sum, 2);
+    sum += __shfl_down_sync(0xffffffff, sum, 1);
+    if (tid == 0) {
+        output[output_token_offset + row] = T(sum);
+    }
+}
+
+template <typename T>
+void sparse_up_batched(const Stream& stream, int num_tokens, int top, int num_blocks, int block_size, int hidden_size, const int* nnz, const int* nz_idx, const T* input, const T* weight, T* output) {
+    constexpr int tile_size = 8;
+    int intermediate_size = num_blocks * block_size;
+    int hidden_size_f4 = hidden_size / (16 / sizeof(T));
+    sparse_up_batched_kernel<T><<<dim3(num_tokens * top, block_size/tile_size), dim3(32, tile_size), 0, stream.stream>>>(
+        top, num_blocks, intermediate_size, hidden_size_f4, tile_size,
+        nnz, nz_idx, (float4*)input, (float4*)weight, output
+    );
+}
+
+template <typename T, typename T2>
+__global__ void sparse_norm_silu_batched_kernel(
+    int top,
+    int num_blocks,
+    int dim,                         // block_size / 2 (T2 units)
+    const int* __restrict__ nnz,
+    const int* __restrict__ nz_idx,
+    const T* __restrict__ nz_val,
+    const T* __restrict__ projected_mean,
+    const T2* __restrict__ norm_weight,
+    float norm_eps,
+    T2* __restrict__ input
+) {
+    int token = blockIdx.x / top;
+    int k = blockIdx.x % top;
+    if (k >= nnz[token]) return;
+
+    int block_idx = nz_idx[token * num_blocks + k];
+    int tid = threadIdx.x;
+
+    __shared__ T2 s_input[1024];
+    __shared__ float shared_sum;
+    __shared__ float warp_sum[4];
+
+    T mean = projected_mean[token];
+    int input_offset = (token * num_blocks + block_idx) * dim;
+
+    float sum1 = 0.0f, sum2 = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        T2 val = input[input_offset + i];
+        float v1 = float(val.x) - float(mean);
+        float v2 = float(val.y) - float(mean);
+        s_input[i] = T2(T(v1), T(v2));
+        sum1 += v1 * v1;
+        sum2 += v2 * v2;
+    }
+
+    float sum = sum1 + sum2;
+    sum += __shfl_down_sync(0xffffffff, sum, 16);
+    sum += __shfl_down_sync(0xffffffff, sum, 8);
+    sum += __shfl_down_sync(0xffffffff, sum, 4);
+    sum += __shfl_down_sync(0xffffffff, sum, 2);
+    sum += __shfl_down_sync(0xffffffff, sum, 1);
+
+    if (tid % 32 == 0) warp_sum[tid / 32] = sum;
+    __syncthreads();
+
+    if (tid < 4) {
+        sum = warp_sum[tid];
+        sum += __shfl_down_sync(0x0000000f, sum, 2);
+        sum += __shfl_down_sync(0x0000000f, sum, 1);
+    }
+
+    if (tid == 0) {
+        shared_sum = rsqrtf(sum / (2 * dim) + norm_eps);
+    }
+    __syncthreads();
+
+    float scale = shared_sum;
+    float router_val = float(nz_val[token * num_blocks + k]);
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+        T2 inp = s_input[i];
+        T2 w = norm_weight[i];
+
+        float v1 = scale * float(inp.x) * float(w.x);
+        float v2 = scale * float(inp.y) * float(w.y);
+
+        v1 = v1 / (1.0f + expf(-v1)) * router_val;
+        v2 = v2 / (1.0f + expf(-v2)) * router_val;
+
+        input[input_offset + i] = T2(T(v1), T(v2));
+    }
+}
+
+template <typename T>
+void sparse_norm_silu_batched(const Stream& stream, int num_tokens, int top, int num_blocks, int block_size, const int* nnz, const int* nz_idx, const T* nz_val, const T* projected_mean, const T* norm_weight, float norm_eps, T* input) {
+    using T2 = typename TypeTraits<T>::half2;
+    sparse_norm_silu_batched_kernel<T, T2><<<num_tokens * top, 128, 0, stream.stream>>>(
+        top, num_blocks, block_size / 2,
+        nnz, nz_idx, nz_val, projected_mean, (T2*)norm_weight, norm_eps, (T2*)input
+    );
+}
+
+template <typename T>
+__global__ void sparse_down_batched_kernel(
+    int top,
+    int num_blocks,
+    int block_size_f4,
+    int intermediate_size_f4,
+    int tile_size,
+    int hidden_size,
+    const int* __restrict__ nnz,
+    const int* __restrict__ nz_idx,
+    const float4* __restrict__ input,
+    const float4* __restrict__ weights,
+    T* __restrict__ output
+) {
+    __shared__ float warp_sum[32];
+    using T2 = typename TypeTraits<T>::half2;
+
+    int token = blockIdx.x;
+    int row = blockIdx.y * tile_size + threadIdx.z;
+    int col = threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int num = nnz[token];
+    int input_token_offset = token * intermediate_size_f4;
+    int output_token_offset = token * hidden_size;
+
+    float4 partial_sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int i = threadIdx.y; i < num; i += blockDim.y) {
+        int offset = nz_idx[token * num_blocks + i] * block_size_f4;
+        float4 a = input[input_token_offset + offset + col];
+        float4 b = weights[row * intermediate_size_f4 + offset + col];
+        T2 prodx = __hmul2(*reinterpret_cast<T2*>(&a.x), *reinterpret_cast<T2*>(&b.x));
+        T2 prody = __hmul2(*reinterpret_cast<T2*>(&a.y), *reinterpret_cast<T2*>(&b.y));
+        T2 prodz = __hmul2(*reinterpret_cast<T2*>(&a.z), *reinterpret_cast<T2*>(&b.z));
+        T2 prodw = __hmul2(*reinterpret_cast<T2*>(&a.w), *reinterpret_cast<T2*>(&b.w));
+        partial_sum.x += float(prodx.x) + float(prodx.y);
+        partial_sum.y += float(prody.x) + float(prody.y);
+        partial_sum.z += float(prodz.x) + float(prodz.y);
+        partial_sum.w += float(prodw.x) + float(prodw.y);
+    }
+    float sum = partial_sum.x + partial_sum.y + partial_sum.z + partial_sum.w;
+    sum += __shfl_down_sync(0xffffffff, sum, 16);
+    sum += __shfl_down_sync(0xffffffff, sum, 8);
+    sum += __shfl_down_sync(0xffffffff, sum, 4);
+    sum += __shfl_down_sync(0xffffffff, sum, 2);
+    sum += __shfl_down_sync(0xffffffff, sum, 1);
+    if (tid % 32 == 0) warp_sum[threadIdx.z * 4 + tid / 32] = sum;
+    __syncthreads();
+    if (tid < 4) {
+        sum = warp_sum[threadIdx.z * 4 + tid];
+        sum += __shfl_down_sync(0x0000000f, sum, 2);
+        sum += __shfl_down_sync(0x0000000f, sum, 1);
+    }
+    if (tid == 0) {
+        output[output_token_offset + row] = T(sum);
+    }
+}
+
+template <typename T>
+void sparse_down_batched(const Stream& stream, int num_tokens, int top, int num_blocks, int block_size, int hidden_size, const int* nnz, const int* nz_idx, const T* input, const T* weight, T* output) {
+    constexpr int tile_size = 8;
+    int block_size_f4 = block_size / (16 / sizeof(T));
+    int intermediate_size_f4 = num_blocks * block_size_f4;
+    sparse_down_batched_kernel<T><<<dim3(num_tokens, hidden_size / tile_size), dim3(block_size_f4, 1024 / tile_size / block_size_f4, tile_size), 0, stream.stream>>>(
+        top, num_blocks, block_size_f4, intermediate_size_f4, tile_size, hidden_size,
+        nnz, nz_idx, (float4*)input, (float4*)weight, output
+    );
+}
+

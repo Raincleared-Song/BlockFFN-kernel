@@ -317,34 +317,59 @@ public:
         if (top == -1) top = this->top;
         if (top > 32) {
             assert(top <= 64);
-            cudaCheck(cudaMemcpyAsync(this->tmp_x, input, num_tokens * dim * sizeof(T), cudaMemcpyDeviceToDevice, stream.stream));
-            bitonic_topk<T>(
-                stream,
-                num_tokens,
-                dim, 32,
-                input,
-                this->head_topk_val, this->head_topk_pos,
-                this->buf_val, this->buf_pos,
-                this->nw_buf_val, this->nw_buf_pos
-            );
-            set_topk_to_neg_inf(stream, num_tokens, dim, 32, this->tmp_x, this->head_topk_pos);
-            bitonic_topk<T>(
-                stream,
-                num_tokens,
-                dim, top - 32,
-                this->tmp_x,
-                this->tail_topk_val, this->tail_topk_pos,
-                this->buf_val, this->buf_pos,
-                this->nw_buf_val, this->nw_buf_pos
-            );
-            copy_split_topk<T>(
-                stream,
-                num_tokens,
-                top, top - 32,
-                this->head_topk_val, this->head_topk_pos,
-                this->tail_topk_val, this->tail_topk_pos,
-                this->topk_val, this->topk_pos
-            );
+            if (num_tokens == 1) {
+                // Single-token fast path: write head directly to topk_val[0..32] and tail to
+                // topk_val[32..top], avoiding the head/tail merge.
+                cudaCheck(cudaMemcpyAsync(this->tmp_x, input, dim * sizeof(T), cudaMemcpyDeviceToDevice, stream.stream));
+                bitonic_topk<T>(
+                    stream,
+                    1,
+                    dim, 32,
+                    input,
+                    this->topk_val, this->topk_pos,
+                    this->buf_val, this->buf_pos,
+                    this->nw_buf_val, this->nw_buf_pos
+                );
+                set_topk_to_neg_inf(stream, 1, dim, 32, this->tmp_x, this->topk_pos);
+                bitonic_topk<T>(
+                    stream,
+                    1,
+                    dim, top - 32,
+                    this->tmp_x,
+                    this->topk_val + 32, this->topk_pos + 32,
+                    this->buf_val, this->buf_pos,
+                    this->nw_buf_val, this->nw_buf_pos
+                );
+            } else {
+                cudaCheck(cudaMemcpyAsync(this->tmp_x, input, num_tokens * dim * sizeof(T), cudaMemcpyDeviceToDevice, stream.stream));
+                bitonic_topk<T>(
+                    stream,
+                    num_tokens,
+                    dim, 32,
+                    input,
+                    this->head_topk_val, this->head_topk_pos,
+                    this->buf_val, this->buf_pos,
+                    this->nw_buf_val, this->nw_buf_pos
+                );
+                set_topk_to_neg_inf(stream, num_tokens, dim, 32, this->tmp_x, this->head_topk_pos);
+                bitonic_topk<T>(
+                    stream,
+                    num_tokens,
+                    dim, top - 32,
+                    this->tmp_x,
+                    this->tail_topk_val, this->tail_topk_pos,
+                    this->buf_val, this->buf_pos,
+                    this->nw_buf_val, this->nw_buf_pos
+                );
+                copy_split_topk<T>(
+                    stream,
+                    num_tokens,
+                    top, top - 32,
+                    this->head_topk_val, this->head_topk_pos,
+                    this->tail_topk_val, this->tail_topk_pos,
+                    this->topk_val, this->topk_pos
+                );
+            }
         } else {
             bitonic_topk<T>(
                 stream,
